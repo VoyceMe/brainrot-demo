@@ -1,82 +1,153 @@
 # Brainrot Demo — Roblox + Character Server Integration
 
 ## Overview
-A gacha-style Roblox demo where players pull AI-powered NPCs, chat with them via Nick's Character Server API, buy them stateful items, and build trust through conversation.
+A gacha-style Roblox demo where players pull AI-powered NPCs, chat with them via the Character Server API, buy them stateful items, and build trust through conversation. NPCs stream responses in real time, use tools to inspect game state and interact with items, and maintain persistent internal state (mood, health, memories) that renders in a schema-driven UI.
 
-**API:** `https://demo-framework-production.up.railway.app`  
+**API:** `https://demo-framework-production.up.railway.app`
+**Local dev:** `http://localhost:3101`
 **Characters:** patrick, rachel, zyxthara, nick
 
 ## Roblox Script Locations
 
 | Script | Location | Type | Purpose |
 |--------|----------|------|---------|
-| `BrainrotServer` | ServerScriptService | Script | All server logic: pulls, chat, items, trust |
+| `BrainrotServer` | ServerScriptService | Script | HTTP communication, streaming, tool execution, state polling |
 | `BrainrotHUD` | StarterGui | LocalScript | Top bar (coins/income), pull button, reveal animation |
-| `BrainrotDialogue` | StarterGui | LocalScript | Chat UI, shop bar, message bubbles |
-| `BrainrotProximity` | StarterPlayer > StarterPlayerScripts | LocalScript | ProximityPrompt hookup, signal to dialogue |
-| `BrainrotConfig` | ReplicatedStorage | ModuleScript | All configuration (API URL, characters, items, colors) |
+| `BrainrotDialogue` | StarterGui | LocalScript | Chat UI, streaming display, tool activity, state bar |
+| `BrainrotProximity` | StarterPlayerScripts | LocalScript | ProximityPrompt hookup, signal to dialogue |
+| `BrainrotConfig` | ReplicatedStorage | ModuleScript | Configuration (API URL, characters, items, colors) |
 | `BrainrotRemotes` | ReplicatedStorage | ModuleScript | RemoteFunction/RemoteEvent creation |
 
 ## How It Works
 
-### Chat Flow
-1. Player presses E → `BrainrotProximity` fires `InteractNPC:InvokeServer(sceneName, "start")`
-2. Server fetches greeting from `GET /character/:name` and returns it
-3. Player types message → `SendMessage:FireServer(sceneName, msg)`
-4. Server calls `POST /chat` with `{message, character, uid, history}`
-5. Server parses SSE response, sends text back via `ReceiveMessage:FireClient`
-6. Trust bumps based on simple sentiment (nice = +5 to +12, mean = -5 to -15)
+### Chat Flow (Streaming + Tool Calling)
+
+1. Player presses E near an NPC -> `BrainrotProximity` fires `InteractNPC:InvokeServer(sceneName, "start")`
+2. Server returns greeting, client opens dialogue and requests initial state (`__request_state__`)
+3. Player types a message -> `SendMessage:FireServer(sceneName, msg)`
+4. Server sends `POST /chat` with a unique `chatId` for poll-based streaming
+5. Server polls `GET /chat/poll/:chatId` every 150ms, forwarding events to the client as they arrive:
+   - `stream_start` — shows typing indicator
+   - `stream_chunk` — progressively updates the response bubble
+   - `tool_activity` — displays what tool the AI is using (purple indicator in chat)
+   - `stream_end` — clears typing state
+6. If the AI calls a **server tool** (e.g., `look_around`, `use_object`), the backend executes it automatically
+7. If the AI calls a **client tool** (e.g., `check_player_coins`), the backend pauses and sends a `client_tool_request`
+8. The Roblox server executes the tool locally using live game state, then resumes via `POST /chat/tool-result`
+9. The AI continues with the tool results — this can loop up to 3 rounds of client tool calls
+
+### Why Polling Instead of SSE?
+
+Roblox's `HttpService:RequestAsync` is synchronous — it blocks until the entire response body is received. This means true SSE streaming is impossible. The workaround:
+
+- The backend buffers all SSE events keyed by `chatId`
+- The Roblox server polls `/chat/poll/:chatId` every 150ms
+- Each poll returns new events since the last cursor position
+- This achieves near-real-time progressive text display
+
+### Client-Side Tools
+
+These tools execute on the Roblox server using live game state, because the backend has no access to in-game data:
+
+| Tool | What It Does |
+|------|-------------|
+| `check_player_coins` | Returns the player's current coin balance |
+| `check_player_trust` | Returns trust level (0-100) with the current NPC |
+| `get_nearby_objects` | Lists NPCs and objects near the player |
+| `get_brainrot_collection` | Lists collected characters with rarity and trust |
+
+The AI decides when to call these — e.g., if you ask "can I afford that?", it might call `check_player_coins` before answering.
+
+### Server-Side Tools
+
+These execute on the Character Server automatically:
+
+| Tool | What It Does |
+|------|-------------|
+| `look_around` | Character sees their location and inventory |
+| `check_time` | Current date and time |
+| `search_inventory` | Search possessions by keyword |
+| `use_object` | Interact with a stateful item (8-ball, notebook, coin, etc.) |
+
+### State Display
+
+A schema-driven state bar sits between the chat header and message area. It renders the NPC's internal state:
+
+- **Health bars** — Physical, mental, energy (colored progress bars)
+- **Mood chip** — Color-coded by sentiment (green = positive, red = negative)
+- **Emotion tags** — Purple chips for current emotions
+- **Status badge** — Current status (healthy, sleepy, excited, etc.)
+- **Possessions** — Teal chips for stateful items, dark chips for plain items
+
+State updates automatically after each conversation (the backend runs a state analysis in the background) and is polled every 5 seconds during active conversations.
 
 ### Item Buy Flow
-1. Player clicks shop button → `BuyItem:InvokeServer(sceneName, itemIndex)`
+
+1. Player clicks shop button -> `BuyItem:InvokeServer(sceneName, itemIndex)`
 2. Server deducts coins, bumps trust by item's `trustBoost`
-3. Server calls `POST /items/:characterName/create` with `{templateId}` to create real API item
-4. On next dialogue open, if player bought items this session, server fires async `POST /chat` with hint asking character to reference items and upsell
+3. Server calls `POST /items/:characterName/create` with `{templateId}` to create a real API item
+4. The AI can now **actually use** the item via the `use_object` tool — no more hallucination
 
-## ⚠️ KNOWN ISSUE — Item Hallucination
+### Item System (Resolved)
 
-**Nick's diagnosis: "It's hallucinating them. It's not even looking at the objects."**
+Previously, NPCs would talk about items without actually using them. This is now fully fixed:
 
-**What's happening:** The character talks ABOUT items ("I love my deck of cards!") but isn't actually USING the item system. When Patrick says "I drew a card," he's making it up — no actual `draw` action was called on the card deck.
-
-**Root cause:** The Roblox client sends a plain `POST /chat` with just the message text. It does NOT:
-1. Process `tool_call` events from the SSE stream (the API returns these when the AI wants to use an item)
-2. Execute `tool_result` responses back to the API
-3. Connect to `GET /events/:characterName` for the persistent SSE event bus
-4. Handle `item_update` events that fire when an item's state changes
-
-**What the API actually supports (from the docs):**
-
-The `/chat` endpoint returns SSE events including:
-- `text` — streamed AI text (we handle this ✅)
-- `tool_call` — AI wants to use an item (e.g. draw a card) ❌ NOT HANDLED
-- `tool_result` — result of tool execution ❌ NOT HANDLED
-- `done` — stream complete (we handle this ✅)
-
-The items have real actions:
-- Playing Cards: `draw` (draw a card), `shuffle` (shuffle deck)
-- Magic 8-Ball: `shake` (get a fortune)
-- Notebook: `write` (write an entry), `read` (read entries)
-- Coin: `flip` (heads or tails)
-
-**What needs to happen:**
-1. Parse `tool_call` events from the chat SSE stream
-2. When AI invokes a tool, the Roblox server needs to... (this is where we need Nick's guidance — does the server auto-execute tools, or does the client need to call an endpoint?)
-3. Feed `tool_result` back into the conversation
-4. Optionally connect to `/events/:characterName` for real-time item state updates
-
-**Current workaround:** We inject text hints like "[You own: Deck of Cards]" into chat prompts so the AI knows about items, but it's faking the interactions rather than using the actual tool system.
+- The backend's `use_object` tool lets the AI interact with stateful items
+- Items have real actions powered by JSONata reducers (e.g., Magic 8-Ball: `ask`, Notebook: `write`/`read`, Coin: `flip`)
+- Item state persists across conversations
+- The `use_object` tool is dynamically injected only when the character has stateful items
+- Plain string items auto-materialize into stateful instances on first use
 
 ## Dependencies
 - Roblox Studio (any recent version)
-- HTTP Service enabled (Game Settings → Security → Allow HTTP Requests)
-- Nick's API running at the configured ENDPOINT_URL
+- HTTP Service enabled (Game Settings > Security > Allow HTTP Requests)
+- Character Server running at the configured `ENDPOINT_URL`
 
 ## Setup
+
 1. Open the `.rbxl` file in Roblox Studio
-2. Verify `BrainrotConfig.ENDPOINT_URL` points to the correct API
-3. Enable HTTP requests in Game Settings
+2. Set `BrainrotConfig.ENDPOINT_URL` to your server:
+   - Local: `http://localhost:3101`
+   - Production: `https://demo-framework-production.up.railway.app`
+3. Enable HTTP requests in Game Settings > Security
 4. Press Play
+
+## Architecture
+
+```
+Player Input
+    |
+    v
+BrainrotDialogue (LocalScript)     BrainrotServer (ServerScript)
+    |  FireServer(msg)                  |
+    |---------------------------------->|
+    |                                   |  POST /chat { chatId }
+    |                                   |-------------------> Character Server
+    |                                   |                         |
+    |                                   |  GET /chat/poll/:chatId | (every 150ms)
+    |                                   |<------------------->    |
+    |  FireClient(stream_chunk)         |                         |
+    |<----------------------------------|                         |
+    |  FireClient(tool_activity)        |                         |
+    |<----------------------------------|                         |
+    |                                   |                         |
+    |                          [client_tool_request?]             |
+    |                                   |                         |
+    |                          executeClientTool()                |
+    |                                   |                         |
+    |                                   |  POST /chat/tool-result |
+    |                                   |------------------------>|
+    |                                   |                         |
+    |  FireClient(stream_chunk)         |  (continues streaming)  |
+    |<----------------------------------|<------------------------|
+    |                                   |
+    |                                   |  GET /state/:character (every 5s)
+    |  FireClient(character_state)      |<----------------------->|
+    |<----------------------------------|
+    |
+    v
+State Bar + Chat Bubbles
+```
 
 ## Files to Export from .rbxl
 If setting up fresh, the 6 scripts listed above need to be placed in their correct locations. The rest of the place (room geometry, BrainrotMachine model, etc.) is part of the base template.
